@@ -22,10 +22,3 @@ resource "local_file" "bucardo_cleanup_instructions_script" {
     service_name = var.service_name,
   })
 }
-
-resource "local_file" "bucardo_reset_instructions_script" {
-  filename = "${path.cwd}/.bucardo_scripts/reset_instructions.${var.service_name}.sh"
-  content  = templatefile("${path.module}/../modules/bucardo/scripts/reset_instructions.sh.tftpl", {
-    service_name = var.service_name,
-  })
-}
