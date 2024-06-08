@@ -1,0 +1,42 @@
+#!bin/bash
+
+# If you wish to reset AFTER you've run `bucardo add sync`, simply recreating the replicator is not enough.
+# You need to reset Bucardo's effects on the Heroku database.
+
+# First, stop replication:
+bucardo stop
+
+# Then run the instructions in the `cleanup_instructions.sh` script.
+
+# Optional. If you're going to recreate the replicator instance, you can ignore these.
+bucardo purge all
+bucardo remove sync ${service_name}
+bucardo remove dbgroup ${service_name}
+bucardo remove relgroup ${service_name}
+bucardo remove db ${service_name}_heroku --force
+
+# Cleaning up on the old (Heroku) database:
+# 1. Drop all functions and triggers added by Bucardo:
+psql "host=$${${upper(service_name)}_PGHOST_HEROKU} port=5432 dbname=$${${upper(service_name)}_PGDATABASE_HEROKU} user=$${${upper(service_name)}_PGUSER_HEROKU}" \
+  -c "select format('DROP FUNCTION bucardo.%I(%s) CASCADE;', proname, pg_get_function_identity_arguments(oid)) from pg_proc where proname LIKE 'bucardo%'" \
+  --tuples-only -o ${service_name}_drop_functions_and_triggers.sql
+cat ${service_name}_drop_functions_and_triggers.sql
+psql "host=$${${upper(service_name)}_PGHOST_HEROKU} port=5432 dbname=$${${upper(service_name)}_PGDATABASE_HEROKU} user=$${${upper(service_name)}_PGUSER_HEROKU}" \
+  -f ${service_name}_drop_functions_and_triggers.sql
+
+# 2. Drop table-specific triggers and functions, eg bucardo.delta_public_credit_score_results()
+psql "host=$${${upper(service_name)}_PGHOST_HEROKU} port=5432 dbname=$${${upper(service_name)}_PGDATABASE_HEROKU} user=$${${upper(service_name)}_PGUSER_HEROKU}" \
+  -c "select format('DROP TRIGGER %I ON %I CASCADE;', tgname, tgrelid::regclass) from pg_trigger where tgname like 'bucardo_%'" \
+  --tuples-only -o ${service_name}_drop_triggers.sql
+cat ${service_name}_drop_triggers.sql
+psql "host=$${${upper(service_name)}_PGHOST_HEROKU} port=5432 dbname=$${${upper(service_name)}_PGDATABASE_HEROKU} user=$${${upper(service_name)}_PGUSER_HEROKU}" \
+  -f ${service_name}_drop_triggers.sql
+
+# 3. Drop the schema created by Bucardo on Heroku
+psql "host=$${${upper(service_name)}_PGHOST_HEROKU} port=5432 dbname=$${${upper(service_name)}_PGDATABASE_HEROKU} user=$${${upper(service_name)}_PGUSER_HEROKU}" \
+  -c "DROP SCHEMA bucardo CASCADE;"
+
+# 4. Remove the Bucardo user from RDS
+psql "host=$${${upper(service_name)}_PGHOST_RDS} port=5432 dbname=$${${upper(service_name)}_PGDATABASE_RDS} user=$${${upper(service_name)}_PGUSER_RDS_ADMIN}" \
+  -c "DROP USER bucardo_replicator;"
+

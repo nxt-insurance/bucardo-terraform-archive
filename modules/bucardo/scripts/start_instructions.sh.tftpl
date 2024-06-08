@@ -1,0 +1,48 @@
+#!bin/bash
+# --- KICKING OFF THE MIGRATION ---
+# THE INSTRUCTIONS IN THIS SCRIPT ARE TO BE RUN MANUALLY ON YOUR MACHINE OR IN THE REPLICATOR INSTANCE, AS THEY ARE STATEFUL.
+
+# First, connect to the instance with the SSH key
+ssh -i "${environment}.bucardo-replicator-key-pair.pem" ubuntu@${replicator_ip}
+
+# You need to be sudo
+sudo su
+
+# Check the logs to be sure the setup script was successful. You might see errors about missing roles; ignore them:
+tail /var/log/cloud-init-output.log -n100
+# tail /var/log/cloud-init.log -n100
+
+# Add the sync. This will also create the necessary tables and triggers in the source database
+# Setting onetimecopy=1 tells Bucardo to do a one-time import before switching to delta (replication) mode
+# It will empty each table on the new database (RDS) first, then it will use COPY to copy data from old db to new db,
+# before moving to the next table.
+bucardo add sync ${service_name} relgroup=${service_name} dbs=${service_name}_heroku,${service_name}_rds onetimecopy=1 analyze_after_copy=0 rebuild_index=0
+
+bucardo list syncs
+
+# Start all syncs
+bucardo start
+
+# Check status of the sync. It may take 20+ minutes to finish initial copy (up to 2 hours for a large database)
+bucardo status ${service_name}
+# Check the guide to Bucardo statuses for what "Current state" means - https://gist.github.com/shalvah/8d8b91d3bfe33f08a2583574b6087426
+
+# -- DEBUGGING TIPS --
+# Check Bucardo logs
+tail /var/log/bucardo/log.bucardo
+
+# Debugging via psql:
+# Old database:
+psql "host=$${${upper(service_name)}_PGHOST_HEROKU} port=5432 dbname=$${${upper(service_name)}_PGDATABASE_HEROKU} user=$${${upper(service_name)}_PGUSER_HEROKU}"
+
+# New database:
+psql "host=$${${upper(service_name)}_PGHOST_RDS} port=5432 dbname=${service_name}_db user=$${${upper(service_name)}_PGUSER_RDS_BUCARDO}"
+
+
+# --- RESTORING INDEXES ---
+# When initial copy is done (bucardo status changed to Good, and "Last Error" is empty), recreate indexes
+psql "host=$${${upper(service_name)}_PGHOST_RDS} port=5432 dbname=${service_name}_db user=$${${upper(service_name)}_PGUSER_RDS_BUCARDO}" -f ${service_name}_add_indexes.sql
+
+
+# Database URL for the app is:
+# postgres://${rds_app_username}:${rds_app_password}@${rds_host}:5432/${rds_database}

@@ -1,0 +1,137 @@
+#!/bin/bash
+
+set -e
+
+# Set up env variables
+echo "
+${upper(service_name)}_PGHOST_RDS='${rds_host}'
+${upper(service_name)}_PGDATABASE_RDS='${rds_database}'" >> /etc/environment
+
+# The credentials for Bucardo to access the RDS db.
+echo "
+${upper(service_name)}_PGUSER_RDS_BUCARDO='${rds_bucardo_username}'
+${upper(service_name)}_PGPASS_RDS_BUCARDO='${rds_bucardo_password}'" >> /etc/environment
+
+# The admin credentials for the RDS database.
+# These are not to be used by Bucardo; we only use them to create the Bucardo user and the app user.
+echo "
+${upper(service_name)}_PGUSER_RDS_ADMIN='${rds_admin_username}'
+${upper(service_name)}_PGPASS_RDS_ADMIN='${rds_admin_password}'" >> /etc/environment
+
+# The credentials for Bucardo to access the Heroku database.
+# These are the same credentials in use by the Heroku apps (the DATABASE_URL env var).
+echo "
+${upper(service_name)}_PGHOST_HEROKU='${heroku_host}'
+${upper(service_name)}_PGDATABASE_HEROKU='${heroku_database}'
+${upper(service_name)}_PGUSER_HEROKU='${heroku_username}'
+${upper(service_name)}_PGPASS_HEROKU='${heroku_password}'" >> /etc/environment
+
+# The credentials for Bucardo's internal PG database.
+# These are not sensitive, since its internal database is transient and not exposed.
+echo "
+BUCARDOUSER=bucardo
+BUCARDOPASS=bucardo" >> /etc/environment
+
+echo "PGPASSFILE=/etc/.pgpass" >> /etc/environment
+
+# Load env vars
+set -a; source /etc/environment; set +a;
+
+# Test connectivity
+nc -zv ${heroku_host} 5432
+nc -zv ${rds_host} 5432
+
+cd /home/ubuntu
+echo "PWD is: $(pwd)"
+
+echo "STEP: Installing Bucardo and dependencies..."
+# We must first remove the default installed PG and install the version matching the old Heroku database,
+# otherwise we'll run into errors
+echo "deb http://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list
+wget --quiet -O - https://www.postgresql.org/media/keys/ACCC4CF8.asc | apt-key add -
+apt-get update
+apt remove postgresql-client-9.6 postgresql-9.6 postgresql-contrib-9.6 postgresql-plperl-9.6
+apt-get install -y postgresql-${heroku_pg_major_version} postgresql-plperl-${heroku_pg_major_version}
+apt-get install -y bucardo libdbix-safe-perl libpq-dev
+
+echo "STEP: Configuring and starting Bucardo's internal database..."
+echo "
+SET session_replication_role = 'replica';
+CREATE EXTENSION plperl;
+CREATE DATABASE bucardo;
+CREATE ROLE bucardo WITH LOGIN SUPERUSER ENCRYPTED PASSWORD 'bucardo';
+" | su - postgres -c "psql postgres"
+echo "dbhost=127.0.0.1
+dbname=bucardo
+dbport=5432
+dbuser=bucardo
+dbpass=bucardo
+loglevel=verbose
+verbose=1" > /etc/bucardorc
+service postgresql start
+
+echo "STEP: Setting credentials for Heroku and RDS in .pgpass..."
+# Set creds in .pgpass we don't have to type in PG password each time in psql
+echo '127.0.0.1:5432:*:bucardo:bucardo
+${heroku_host}:5432:*:${heroku_username}:${heroku_password}
+${rds_host}:5432:*:${rds_bucardo_username}:${rds_bucardo_password}
+${rds_host}:5432:*:${rds_admin_username}:${rds_admin_password}
+${rds_host}:5432:*:${rds_app_username}:${rds_app_password}' >> /etc/.pgpass
+
+chmod 0600 /etc/.pgpass
+
+# Some of the following SQL commands may report ERRORs (user does not exist, database already exists), but that's fine.
+# Note: the rds_superuser role is needed to create extensions.
+echo "STEP: Setting up RDS users for Bucardo and app..."
+echo "
+CREATE USER ${rds_bucardo_username} IN GROUP rds_superuser PASSWORD '${rds_bucardo_password}';
+CREATE USER ${rds_app_username} WITH PASSWORD '${rds_app_password}' NOSUPERUSER NOCREATEDB NOCREATEROLE;
+CREATE USER ${rds_reader_username} WITH PASSWORD '${rds_reader_password}' NOSUPERUSER NOCREATEDB NOCREATEROLE;
+" | psql -h ${rds_host} -p 5432 -U ${rds_admin_username} -d postgres
+
+echo "STEP: Setting up RDS database..."
+echo "
+CREATE DATABASE ${rds_database};
+REVOKE ALL ON DATABASE ${rds_database} FROM PUBLIC;
+GRANT ALL ON DATABASE ${rds_database} TO ${rds_app_username};
+GRANT CONNECT ON DATABASE ${rds_database} TO ${rds_reader_username};
+" | psql -h ${rds_host} -p 5432 -U ${rds_admin_username} -d postgres
+
+echo "STEP: Dumping schema and extensions from Heroku..."
+pg_dump "host=${heroku_host} port=5432 dbname=${heroku_database} user=${heroku_username}" \
+  -n public --schema-only > ${service_name}_schema.sql
+sed -i "s/${heroku_username}/${rds_app_username}/g" ${service_name}_schema.sql
+psql "host=${heroku_host} port=5432 dbname=${heroku_database} user=${heroku_username}" \
+  -c "select format('CREATE EXTENSION %s;', extname) from pg_extension" \
+  --tuples-only -o ${service_name}_schema_extensions.sql
+
+# We'll drop all indexes temporarily, as they slow down the initial copy significantly. We'll add them later.
+# Note: this is unsafe to rerun post-migration. Ideally, you should skip creating indexes instead. 
+grep -oP 'CREATE (UNIQUE )?INDEX \K[^ ]+' ${service_name}_schema.sql |  awk '{print "DROP INDEX " $1 ";"}' > ${service_name}_temporarily_drop_indexes.sql
+grep -E '^CREATE (UNIQUE )?INDEX' ${service_name}_schema.sql > ${service_name}_add_indexes.sql
+
+# This is safe to repeat, because the DDL commands will fail and move to the next one if already present
+echo "STEP: Loading schema and extensions into RDS..."
+psql "host=${rds_host} port=5432 dbname=${rds_database} user=${rds_bucardo_username}" -f ${service_name}_schema_extensions.sql
+psql "host=${rds_host} port=5432 dbname=${rds_database} user=${rds_bucardo_username}" -f ${service_name}_schema.sql
+psql "host=${rds_host} port=5432 dbname=${rds_database} user=${rds_bucardo_username}" -f ${service_name}_temporarily_drop_indexes.sql
+
+# The schema dump from Heroku sets the OWNER of the schema to the _app account, so no extra permissions needed.
+# We now need to add permissions for the _reader account (used in the replica)
+echo "STEP: Configuring permissions for RDS replica user..."
+echo "
+GRANT USAGE ON SCHEMA public TO ${rds_reader_username};
+GRANT SELECT ON ALL TABLES IN SCHEMA public TO ${rds_reader_username};
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO ${rds_reader_username};
+" | psql -h ${rds_host} -p 5432 -U ${rds_app_username} -d ${rds_database}
+
+echo "STEP: Configuring Bucardo..."
+echo "P" | bucardo install
+
+echo "STEP: Registering databases with Bucardo..."
+bucardo add db ${service_name}_heroku host=${heroku_host} port=5432 dbname=${heroku_database} user=${heroku_username} pass=${heroku_password} conn="sslmode=require"
+bucardo add db ${service_name}_rds host=${rds_host} port=5432 dbname=${rds_database} user=${rds_bucardo_username} pass=${rds_bucardo_password} conn="sslmode=require"
+
+# Fetch the tables and sequences from the old database, and add them to a `relgroup`.
+bucardo add all tables db=${service_name}_heroku --relgroup=${service_name} --verbose
+bucardo add all sequences db=${service_name}_heroku --relgroup=${service_name} --verbose
