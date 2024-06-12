@@ -105,16 +105,15 @@ psql "host=${heroku_host} port=5432 dbname=${heroku_database} user=${heroku_user
   -c "select format('CREATE EXTENSION %s;', extname) from pg_extension" \
   --tuples-only -o ${service_name}_schema_extensions.sql
 
-# We'll drop all indexes temporarily, as they slow down the initial copy significantly. We'll add them later.
-# Note: this is unsafe to rerun post-migration. Ideally, you should skip creating indexes instead. 
-grep -oP 'CREATE (UNIQUE )?INDEX \K[^ ]+' ${service_name}_schema.sql |  awk '{print "DROP INDEX " $1 ";"}' > ${service_name}_temporarily_drop_indexes.sql
+# We'll remove indexes from the schema and add them later, as they slow down the initial copy significantly.
 grep -E '^CREATE (UNIQUE )?INDEX' ${service_name}_schema.sql > ${service_name}_add_indexes.sql
+sed -i -E 's/^CREATE INDEX/CREATE INDEX CONCURRENTLY/I; s/^CREATE UNIQUE INDEX/CREATE UNIQUE INDEX CONCURRENTLY/I' ${service_name}_add_indexes.sql
+sed -i -E '/^CREATE( UNIQUE)? INDEX/I d' ${service_name}_schema.sql
 
 # This is safe to repeat, because the DDL commands will fail and move to the next one if already present
 echo "STEP: Loading schema and extensions into RDS..."
 psql "host=${rds_host} port=5432 dbname=${rds_database} user=${rds_bucardo_username}" -f ${service_name}_schema_extensions.sql
 psql "host=${rds_host} port=5432 dbname=${rds_database} user=${rds_bucardo_username}" -f ${service_name}_schema.sql
-psql "host=${rds_host} port=5432 dbname=${rds_database} user=${rds_bucardo_username}" -f ${service_name}_temporarily_drop_indexes.sql
 
 # The schema dump from Heroku sets the OWNER of the schema to the _app account, so no extra permissions needed.
 # We now need to add permissions for the _reader account (used in the replica)
